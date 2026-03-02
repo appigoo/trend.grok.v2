@@ -2652,65 +2652,46 @@ if st.session_state.alert_log:
         if score >= 30:   return "🟠 偏空",     "#ff8800", int(score)
         return                   "🔴 強勢空頭", "#ff4444", int(score)
 
-    # ── 每股摘要卡片（橫向排列）────────────────────────────────────────────
+    # ── 每股摘要卡片（純 HTML flex，避免 st.columns DOM 衝突）────────────────
     syms = sorted(sym_stats.keys())
-    cols = st.columns(min(len(syms), 4))
-    for i, sym in enumerate(syms):
+    all_cards = ['<div style="display:flex;flex-wrap:wrap;gap:12px;margin:12px 0;">']
+    for sym in syms:
         ss = sym_stats[sym]
         bull, bear, vol = ss["bull"], ss["bear"], ss["vol"]
         total = bull + bear + vol + ss["info"]
         trend_lbl, trend_color, score = _trend_label(bull, bear, vol)
-
-        # Most active period
-        periods = ss["periods"]
+        periods    = ss["periods"]
         top_period = max(periods, key=periods.get) if periods else "-"
-
-        # Signal frequency summary
         sig_counts = defaultdict(int)
         for s in ss["signals"]:
-            # Categorize signal type
-            if "金叉" in s or "上穿" in s:     sig_counts["金叉/上穿"] += 1
-            elif "死叉" in s or "下穿" in s:   sig_counts["死叉/下穿"] += 1
-            elif "突破阻力" in s:               sig_counts["突破阻力"] += 1
-            elif "跌破支撐" in s:               sig_counts["跌破支撐"] += 1
-            elif "異常放量" in s:               sig_counts["異常放量"] += 1
-            else:                               sig_counts["其他"] += 1
-
-        top_sig = max(sig_counts, key=sig_counts.get) if sig_counts else "-"
+            if   "金叉" in s or "上穿" in s:  sig_counts["金叉/上穿"] += 1
+            elif "死叉" in s or "下穿" in s:  sig_counts["死叉/下穿"] += 1
+            elif "突破阻力" in s:              sig_counts["突破阻力"]  += 1
+            elif "跌破支撐" in s:              sig_counts["跌破支撐"]  += 1
+            elif "異常放量" in s:              sig_counts["異常放量"]  += 1
+            else:                              sig_counts["其他"]       += 1
+        top_sig   = max(sig_counts, key=sig_counts.get) if sig_counts else "-"
         top_sig_n = sig_counts.get(top_sig, 0)
-
-        card_html = (
-            f'<div style="background:#0c1220;border:1px solid {trend_color}44;'
-            f'border-radius:12px;padding:14px 16px;margin:4px 0;">'
-            # Symbol + trend
-            f'<div style="font-size:1.1rem;font-weight:800;color:#ccd6ee;margin-bottom:6px;">'
-            f'${sym}</div>'
-            f'<div style="font-size:0.92rem;font-weight:700;color:{trend_color};margin-bottom:10px;">'
-            f'{trend_lbl}</div>'
-            # Score bar
-            f'<div style="background:#141c2e;border-radius:4px;height:6px;margin-bottom:10px;">'
-            f'<div style="width:{score}%;background:{trend_color};height:6px;border-radius:4px;'
-            f'transition:width 0.5s;"></div></div>'
-            # Stats row
-            f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
-            f'<span style="background:#0d2e18;color:#00ee66;border-radius:4px;'
-            f'padding:2px 7px;font-size:0.75rem;">🟢 多 {bull}</span>'
-            f'<span style="background:#2e0d0d;color:#ff5566;border-radius:4px;'
-            f'padding:2px 7px;font-size:0.75rem;">🔴 空 {bear}</span>'
-            f'<span style="background:#1a1428;color:#cc88ff;border-radius:4px;'
-            f'padding:2px 7px;font-size:0.75rem;">📊 量 {vol}</span>'
-            f'<span style="background:#141c2e;color:#7799cc;border-radius:4px;'
-            f'padding:2px 7px;font-size:0.75rem;">共 {total}</span>'
+        all_cards.append(
+            f'<div style="flex:1;min-width:180px;max-width:260px;background:#0c1220;'
+            f'border:1px solid {trend_color}55;border-radius:12px;padding:14px 16px;">'
+            f'<div style="font-size:1.1rem;font-weight:800;color:#ccd6ee;margin-bottom:4px;">${sym}</div>'
+            f'<div style="font-size:0.88rem;font-weight:700;color:{trend_color};margin-bottom:8px;">{trend_lbl}</div>'
+            f'<div style="background:#141c2e;border-radius:3px;height:5px;margin-bottom:10px;">'
+            f'<div style="width:{score}%;background:{trend_color};height:5px;border-radius:3px;"></div></div>'
+            f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">'
+            f'<span style="background:#0d2e18;color:#00ee66;border-radius:4px;padding:1px 6px;font-size:0.72rem;">🟢 {bull}</span>'
+            f'<span style="background:#2e0d0d;color:#ff5566;border-radius:4px;padding:1px 6px;font-size:0.72rem;">🔴 {bear}</span>'
+            f'<span style="background:#1a1428;color:#cc88ff;border-radius:4px;padding:1px 6px;font-size:0.72rem;">📊 {vol}</span>'
+            f'<span style="background:#141c2e;color:#7799cc;border-radius:4px;padding:1px 6px;font-size:0.72rem;">Σ {total}</span>'
             f'</div>'
-            # Top signal + period
-            f'<div style="font-size:0.75rem;color:#556688;line-height:1.7;">'
+            f'<div style="font-size:0.72rem;color:#445566;line-height:1.8;">'
             f'主要信號：<span style="color:#aabbcc">{top_sig} ×{top_sig_n}</span><br>'
             f'活躍週期：<span style="color:#aabbcc">{top_period}</span>'
-            f'</div>'
-            f'</div>'
+            f'</div></div>'
         )
-        with cols[i % len(cols)]:
-            st.markdown(card_html, unsafe_allow_html=True)
+    all_cards.append('</div>')
+    st.markdown("".join(all_cards), unsafe_allow_html=True)
 
     # ── 整體市場情緒 ─────────────────────────────────────────────────────────
     total_bull = sum(v["bull"] for v in sym_stats.values())
