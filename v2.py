@@ -371,6 +371,157 @@ def fetch_vix_history() -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
+@st.cache_data(ttl=120)
+def fetch_vix_term_structure() -> dict:
+    """
+    抓取 VIX 期限結構數據：
+    - VIX 現貨 (^VIX)
+    - VIX9D 超短期 (^VIX9D) — 9日隱含波動率
+    - VIX3M 中期 (^VIX3M) — 3個月
+    - VIX6M 長期 (^VIX6M) — 6個月
+    - SPY 期貨替代：用 SPY 當日漲跌幅近似期貨壓力
+
+    回傳 dict with:
+      spot, vix9d, vix3m, vix6m,
+      structure: 'contango' | 'backwardation' | 'flat'
+      panic_type: 'short_term' | 'systemic' | 'normal'
+      interpretation: str (中文解讀)
+      score: float (0=極度恐慌, 100=極度平靜)
+    """
+    result = {
+        "spot": None, "vix9d": None, "vix3m": None, "vix6m": None,
+        "structure": "unknown", "panic_type": "normal",
+        "interpretation": "", "alert": None, "alert_type": "info",
+        "contango_pct": None,
+    }
+
+    def _fetch_last(ticker):
+        try:
+            df = yf.download(ticker, period="3d", interval="1d",
+                             auto_adjust=True, progress=False)
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            s = df["Close"].dropna()
+            return float(s.iloc[-1]) if not s.empty else None
+        except Exception:
+            return None
+
+    spot  = _fetch_last("^VIX")
+    vix9d = _fetch_last("^VIX9D")
+    vix3m = _fetch_last("^VIX3M")
+    vix6m = _fetch_last("^VIX6M")
+
+    result.update({"spot": spot, "vix9d": vix9d, "vix3m": vix3m, "vix6m": vix6m})
+
+    if spot is None or vix3m is None:
+        result["interpretation"] = "期限結構數據不足"
+        return result
+
+    # ── 計算期限結構 ──────────────────────────────────────────────────────
+    # Contango = 正常：遠月 > 近月（市場平靜，未來不確定性溢價）
+    # Backwardation = 警告：近月 > 遠月（當下恐慌 > 未來預期）
+    contango_pct = (vix3m - spot) / spot * 100   # 正 = contango, 負 = backwardation
+
+    if contango_pct > 5:
+        structure = "contango"
+    elif contango_pct < -3:
+        structure = "backwardation"
+    else:
+        structure = "flat"
+
+    result["structure"]    = structure
+    result["contango_pct"] = contango_pct
+
+    # ── VIX 當日變化 ─────────────────────────────────────────────────────
+    try:
+        vix_df = yf.download("^VIX", period="5d", interval="1d",
+                             auto_adjust=True, progress=False)
+        vix_df.columns = [c[0] if isinstance(c, tuple) else c for c in vix_df.columns]
+        vix_series = vix_df["Close"].dropna()
+        vix_1d_chg_pct = float((vix_series.iloc[-1] - vix_series.iloc[-2])
+                               / vix_series.iloc[-2] * 100) if len(vix_series) >= 2 else 0
+    except Exception:
+        vix_1d_chg_pct = 0
+
+    # ── SPY 日漲跌幅（近似期貨壓力）─────────────────────────────────────
+    try:
+        spy_df = yf.download("SPY", period="5d", interval="1d",
+                             auto_adjust=True, progress=False)
+        spy_df.columns = [c[0] if isinstance(c, tuple) else c for c in spy_df.columns]
+        spy_s = spy_df["Close"].dropna()
+        spy_1d_chg_pct = float((spy_s.iloc[-1] - spy_s.iloc[-2])
+                               / spy_s.iloc[-2] * 100) if len(spy_s) >= 2 else 0
+    except Exception:
+        spy_1d_chg_pct = 0
+
+    # ── 核心理論判斷 ─────────────────────────────────────────────────────
+    vix_spike  = vix_1d_chg_pct > 15    # VIX 單日暴升 >15%
+    spy_drop   = spy_1d_chg_pct < -1.5  # SPY 下跌 >1.5%（期貨壓力）
+    vix_high   = spot > 25
+
+    if vix_spike and not spy_drop and structure in ("contango", "flat"):
+        # 情境一：VIX 暴升但期貨壓力小 + 仍是 Contango → 短期恐慌底
+        panic_type = "short_term"
+        interpretation = (
+            f"📊 VIX 暴升 +{vix_1d_chg_pct:.1f}% 但 SPY 跌幅有限 ({spy_1d_chg_pct:+.1f}%)"
+            f"，期限結構仍為 Contango（遠月溢價 {contango_pct:+.1f}%）。"
+            f"市場認為「短期嚇一嚇」，非系統性風險。"
+            f"👉 有機會是短期恐慌底，可留意反彈買入機會。"
+        )
+        alert_msg  = f"🟡 短期恐慌底訊號｜VIX 暴升+{vix_1d_chg_pct:.0f}% 但結構 Contango，非系統風險"
+        alert_type = "info"
+
+    elif vix_spike and spy_drop and structure == "backwardation":
+        # 情境二：VIX + 期貨一起大升 + Backwardation → 真風險
+        panic_type = "systemic"
+        interpretation = (
+            f"🚨 VIX 暴升 +{vix_1d_chg_pct:.1f}% 且 SPY 重跌 {spy_1d_chg_pct:+.1f}%"
+            f"，期限結構出現 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
+            f"近月恐慌 > 遠月預期，市場對當前風險定價極高。"
+            f"👉 真風險訊號，可能進入中期調整，建議降低倉位。"
+        )
+        alert_msg  = f"🔴 系統性風險｜VIX Backwardation 出現！近月溢價 {abs(contango_pct):.1f}%，中期調整風險高"
+        alert_type = "bear"
+
+    elif vix_high and structure == "backwardation":
+        # VIX 高位 + Backwardation（即使今天沒有暴升）
+        panic_type = "systemic"
+        interpretation = (
+            f"⚠️ VIX 持續高位 {spot:.1f} 且期限結構 Backwardation（近月溢價 {abs(contango_pct):.1f}%）。"
+            f"市場仍在為當前風險大幅溢價，恐慌尚未消退。"
+            f"👉 中期調整訊號持續，謹慎操作。"
+        )
+        alert_msg  = f"🔴 持續風險｜VIX {spot:.1f} + Backwardation，中期調整未結束"
+        alert_type = "bear"
+
+    elif structure == "contango" and spot < 20:
+        # 完全正常
+        panic_type = "normal"
+        interpretation = (
+            f"✅ VIX {spot:.1f}，期限結構正常 Contango（遠月溢價 +{contango_pct:.1f}%）。"
+            f"市場平靜，無系統性風險訊號。"
+        )
+        alert_msg  = None
+        alert_type = "info"
+
+    else:
+        panic_type = "watch"
+        interpretation = (
+            f"🟡 VIX {spot:.1f}，期限結構 {structure}（近遠月差 {contango_pct:+.1f}%）。"
+            f"保持關注，尚未觸發明確風險訊號。"
+        )
+        alert_msg  = None
+        alert_type = "info"
+
+    result.update({
+        "panic_type":     panic_type,
+        "interpretation": interpretation,
+        "alert":          alert_msg,
+        "alert_type":     alert_type,
+        "vix_1d_chg_pct": vix_1d_chg_pct,
+        "spy_1d_chg_pct": spy_1d_chg_pct,
+    })
+    return result
+
 def get_vix_regime(vix: float) -> tuple:
     """回傳 (狀態描述, 顏色, 條寬%) """
     if vix < 13:   return ("超低波動 😴",  "#00ee66", 10)
@@ -519,6 +670,7 @@ def render_market_environment():
 
     mkt      = fetch_market_data()
     vix_hist = fetch_vix_history()
+    vix_term = fetch_vix_term_structure()
 
     # ── 第一行：大盤指數卡片 ─────────────────────────────────────────────
     card_keys = ["spy", "qqq", "dia", "gld", "uup", "tnx"]
@@ -660,8 +812,132 @@ def render_market_environment():
                 unsafe_allow_html=True
             )
 
+    # ── VIX 期限結構分析（短期恐慌 vs 系統性風險）────────────────────────
+    st.markdown("")
+    spot   = vix_term.get("spot")
+    vix9d  = vix_term.get("vix9d")
+    vix3m  = vix_term.get("vix3m")
+    vix6m  = vix_term.get("vix6m")
+    struct = vix_term.get("structure", "unknown")
+    ptype  = vix_term.get("panic_type", "normal")
+    c_pct  = vix_term.get("contango_pct")
+
+    struct_color = {"contango": "#00ee66", "backwardation": "#ff4444",
+                    "flat": "#ffcc00", "unknown": "#778899"}.get(struct, "#778899")
+    struct_label = {"contango": "Contango ✅ 遠月溢價（正常）",
+                    "backwardation": "Backwardation 🚨 近月溢價（警告）",
+                    "flat": "Flat ⚖️ 近平",
+                    "unknown": "數據不足"}.get(struct, "—")
+    ptype_color  = {"short_term": "#ffcc00", "systemic": "#ff4444",
+                    "normal": "#00ee66",     "watch": "#ff8800"}.get(ptype, "#778899")
+    ptype_label  = {"short_term": "🟡 短期恐慌底（可能反彈）",
+                    "systemic":   "🔴 系統性風險（中期調整）",
+                    "normal":     "🟢 市場正常",
+                    "watch":      "🟠 觀察中"}.get(ptype, "—")
+
+    def _fmt(v): return f"{v:.2f}" if v is not None else "N/A"
+
+    # Build term structure bar chart data
+    ts_points = []
+    if vix9d:  ts_points.append(("VIX9D\n超短期", vix9d))
+    if spot:   ts_points.append(("VIX\n現貨", spot))
+    if vix3m:  ts_points.append(("VIX3M\n3個月", vix3m))
+    if vix6m:  ts_points.append(("VIX6M\n6個月", vix6m))
+
+    term_cols = st.columns([2, 3])
+
+    with term_cols[0]:
+        # Numeric grid
+        grid_html = (
+            '<div style="background:#0a0e18;border:1px solid #1e2e48;border-radius:12px;padding:14px 16px;">'
+            '<div style="font-size:0.82rem;font-weight:700;color:#7799cc;margin-bottom:10px;letter-spacing:1px;">📐 VIX 期限結構</div>'
+            f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">'
+        )
+        for lbl, val in [("VIX9D", vix9d), ("VIX 現貨", spot), ("VIX3M", vix3m), ("VIX6M", vix6m)]:
+            is_high = val and val > 25
+            c = "#ff4444" if is_high else "#ccd6ee"
+            grid_html += (
+                f'<div style="background:#0c1220;border:1px solid #1e2e48;border-radius:8px;'
+                f'padding:6px 10px;text-align:center;min-width:72px;">'
+                f'<div style="font-size:0.65rem;color:#556688;">{lbl}</div>'
+                f'<div style="font-size:1.0rem;font-weight:800;color:{c};">{_fmt(val)}</div>'
+                f'</div>'
+            )
+        grid_html += '</div>'
+        grid_html += (
+            f'<div style="margin-bottom:6px;">'
+            f'<span style="font-size:0.72rem;color:#445566;">結構：</span>'
+            f'<span style="font-size:0.78rem;font-weight:700;color:{struct_color};">{struct_label}</span>'
+            f'</div>'
+            f'<div>'
+            f'<span style="font-size:0.72rem;color:#445566;">判斷：</span>'
+            f'<span style="font-size:0.78rem;font-weight:700;color:{ptype_color};">{ptype_label}</span>'
+            f'</div>'
+        )
+        if c_pct is not None:
+            bar_w   = min(100, abs(c_pct) * 3)
+            bar_col = "#00ee66" if c_pct > 0 else "#ff4444"
+            sign    = "遠月溢價" if c_pct > 0 else "近月溢價"
+            grid_html += (
+                f'<div style="margin-top:10px;">'
+                f'<div style="font-size:0.68rem;color:#445566;margin-bottom:3px;">'
+                f'{sign} {abs(c_pct):.1f}%</div>'
+                f'<div style="background:#141c2e;border-radius:3px;height:5px;">'
+                f'<div style="width:{bar_w}%;background:{bar_col};height:5px;border-radius:3px;"></div>'
+                f'</div></div>'
+            )
+        grid_html += '</div>'
+        st.markdown(grid_html, unsafe_allow_html=True)
+
+    with term_cols[1]:
+        # Interpretation box + mini chart
+        interp = vix_term.get("interpretation", "")
+        box_col = {"short_term": "#332200", "systemic": "#330000",
+                   "normal": "#002200", "watch": "#221500"}.get(ptype, "#0a0e18")
+        border_col = {"short_term": "#ffcc00", "systemic": "#ff4444",
+                      "normal": "#00ee66",     "watch": "#ff8800"}.get(ptype, "#1e2e48")
+        st.markdown(
+            f'<div style="background:{box_col};border:1px solid {border_col}55;'
+            f'border-radius:12px;padding:14px 16px;font-size:0.82rem;'
+            f'color:#aabbcc;line-height:1.8;">'
+            f'<div style="font-size:0.75rem;color:#556688;margin-bottom:6px;letter-spacing:1px;">'
+            f'📖 理論解讀</div>'
+            f'{interp}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        # Mini term structure line chart
+        if len(ts_points) >= 3:
+            import plotly.graph_objects as _go
+            labels = [p[0] for p in ts_points]
+            values = [p[1] for p in ts_points]
+            line_c = "#ff4444" if struct == "backwardation" else "#00ee66"
+            ts_fig = _go.Figure(_go.Scatter(
+                x=labels, y=values, mode="lines+markers+text",
+                line=dict(color=line_c, width=2.5),
+                marker=dict(size=8, color=line_c),
+                text=[f"{v:.1f}" for v in values],
+                textposition="top center",
+                textfont=dict(size=10, color="#ccd6ee"),
+            ))
+            ts_fig.update_layout(
+                height=130, margin=dict(l=0, r=0, t=10, b=0),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+                xaxis=dict(tickfont=dict(size=9, color="#556688"),
+                           showgrid=False, zeroline=False),
+                yaxis=dict(showgrid=False, visible=False),
+            )
+            st.plotly_chart(ts_fig, use_container_width=True,
+                            config={"displayModeBar": False}, key="vix_term_chart")
+
     # ── 第三行：市場環境警示 ──────────────────────────────────────────────
     mkt_alerts = []
+    # VIX 期限結構警示（最高優先）
+    if vix_term.get("alert"):
+        mkt_alerts.append((vix_term["alert_type"], vix_term["alert"]))
+
     if vix_now > 30:
         mkt_alerts.append(("bear", f"⚠️ VIX 極度恐慌 {vix_now:.1f}，市場波動劇烈，建議謹慎操作"))
     elif vix_now > 25:
@@ -1361,7 +1637,7 @@ def render_ai_result_card(result: dict, compact: bool = False):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def render_groq_key_setup():
+def render_groq_key_setup(uid: str = "default"):
     """若沒有 Groq Key，顯示設定引導（簡潔版）"""
     st.markdown(
         '<div class="ai-panel">'
@@ -1381,7 +1657,7 @@ def render_groq_key_setup():
         "Groq API Key",
         type="password",
         placeholder="gsk_...",
-        key="groq_key_setup_input",
+        key=f"groq_key_setup_input_{uid}",
     )
     if key_input:
         st.session_state["groq_key"] = key_input.strip()
@@ -1393,7 +1669,7 @@ def render_ai_analysis(symbol: str, interval_label: str, df: pd.DataFrame,
                        mkt: dict = None):
     """Groq 專用：顯示 Key 設定 或 手動觸發分析"""
     if not get_groq_key():
-        render_groq_key_setup()
+        render_groq_key_setup(uid=f"{symbol}_{interval_label}")
         return
 
     col_title, col_btn = st.columns([4, 1])
