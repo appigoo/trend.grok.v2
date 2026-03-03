@@ -3347,7 +3347,7 @@ with st.sidebar:
     st.title("📈 美股監控系統")
     st.markdown("---")
 
-    raw_input = st.text_area("股票代號（逗號分隔）", value="TSLA,AAPL,NVDA", height=80)
+    raw_input = st.text_area("股票代號（逗號分隔）", value="TSLA", height=80)
     symbols   = [s.strip().upper() for s in raw_input.replace("，",",").split(",") if s.strip()]
 
     st.markdown("---")
