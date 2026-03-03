@@ -2747,9 +2747,15 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
             rep_pos.append(g0 + int(seg_vals.argmax()))
 
         rep_x    = [xlabels[p]  for p in rep_pos]
-        rep_vol  = [float(vol.values[p])    for p in rep_pos]
-        rep_ma   = [float(vol_ma5.values[p]) if not np.isnan(vol_ma5.values[p]) else 1
-                    for p in rep_pos]
+        rep_vol  = [float(vol.values[p]) for p in rep_pos]
+        rep_ma   = []
+        for p in rep_pos:
+            mv = vol_ma5.values[p]
+            try:
+                import math
+                rep_ma.append(float(mv) if not math.isnan(float(mv)) else 1.0)
+            except Exception:
+                rep_ma.append(1.0)
         mult_txt = [f"異常放量 {v/max(m,1):.1f}x 均量"
                     for v, m in zip(rep_vol, rep_ma)]
 
