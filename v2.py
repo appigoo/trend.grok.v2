@@ -1857,6 +1857,14 @@ def calc_macd(s, fast=12, slow=26, sig=9):
     dea  = calc_ema(dif, sig)
     return dif, dea, (dif - dea) * 2
 
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
 def calc_pivot(df, interval: str = "1d"):
     """
     依週期動態調整掃描參數，並用「價格合理範圍過濾（±30%）」
@@ -1922,90 +1930,627 @@ def get_ema_signal(df) -> str:
     if e5.iloc[-1] < e20.iloc[-1] and e5.iloc[-2] >= e20.iloc[-2]: return "空排↓"
     return "EMA↑" if e5.iloc[-1] > e20.iloc[-1] else "EMA↓"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 線性回歸通道偵測
+# ══════════════════════════════════════════════════════════════════════════════
+def calc_channel(df, lookback=25):
+    """
+    線性回歸通道：上軌/中軌/下軌 + R² + 方向
+    """
+    import numpy as np
+    if len(df) < lookback:
+        return None
+    sub   = df.tail(lookback)
+    hi    = sub["High"].values.astype(float)
+    lo    = sub["Low"].values.astype(float)
+    cl    = sub["Close"].values.astype(float)
+    x     = np.arange(len(cl), dtype=float)
+
+    mid_c   = np.polyfit(x, cl, 1)
+    mid_y   = np.polyval(mid_c, x)
+    hi_c    = np.polyfit(x, hi, 1)
+    lo_c    = np.polyfit(x, lo, 1)
+    upper_y = np.polyval(hi_c, x)
+    lower_y = np.polyval(lo_c, x)
+
+    ss_res = ((cl - mid_y) ** 2).sum()
+    ss_tot = ((cl - cl.mean()) ** 2).sum()
+    r2     = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    slope_pct = mid_c[0] / cl.mean() * 100
+    direction = "up" if slope_pct > 0.015 else ("down" if slope_pct < -0.015 else "flat")
+
+    width_pct = (upper_y[-1] - lower_y[-1]) / mid_y[-1] * 100
+
+    return {
+        "direction": direction,
+        "slope_pct": slope_pct,
+        "upper":     float(upper_y[-1]),
+        "mid":       float(mid_y[-1]),
+        "lower":     float(lower_y[-1]),
+        "r2":        r2,
+        "width_pct": width_pct,
+    }
+
+
+def detect_channel_signals(df):
+    """
+    偵測通道反轉買賣訊號，回傳 list of (msg, atype, is_action)
+    涵蓋：下降通道底反彈、上升通道頂壓回、通道方向突破
+    is_action=True 代表強力買入/賣出信號，觸發 Toast
+    """
+    signals = []
+    if len(df) < 30:
+        return signals
+
+    close  = df["Close"]
+    high   = df["High"]
+    low    = df["Low"]
+    opn    = df["Open"]
+    vol    = df["Volume"]
+    price  = float(close.iloc[-1])
+    prev   = float(close.iloc[-2])
+    prev_l = float(low.iloc[-2])
+    prev_h = float(high.iloc[-2])
+
+    dif, dea, hist = calc_macd(close)
+    rsi = calc_rsi(close, 14)
+    vol_ma5 = vol.rolling(5).mean()
+    is_bull_bar = price > float(opn.iloc[-1])
+    is_bear_bar = price < float(opn.iloc[-1])
+
+    for lookback, label in [(15, "短"), (25, "中"), (40, "長")]:
+        ch = calc_channel(df, lookback=lookback)
+        # 降低 R² 門檻至 0.30，提高靈敏度
+        if ch is None or ch["r2"] < 0.30:
+            continue
+
+        tol = (ch["upper"] - ch["lower"]) * 0.25   # 容差 = 通道寬 25%
+
+        # ── A. 下降通道底部反彈（買入機會）──────────────────────────────────
+        if ch["direction"] == "down":
+
+            # 條件：前根觸及下軌 + 當根陽線反彈
+            touched = prev_l <= ch["lower"] + tol
+            bounced = price > prev and is_bull_bar
+
+            if touched and bounced:
+                tags   = []
+                score  = 0   # 共振分數
+
+                # MACD 柱負值收縮（底背離）
+                if (hist.iloc[-1] < 0
+                        and abs(hist.iloc[-1]) < abs(hist.iloc[-2])):
+                    tags.append("MACD柱收縮"); score += 1
+                # DIF 回升
+                if dif.iloc[-1] > dif.iloc[-2]:
+                    tags.append("DIF回升"); score += 1
+                # RSI 超賣（<35）反彈
+                if not rsi.empty and rsi.iloc[-2] < 35 and rsi.iloc[-1] > rsi.iloc[-2]:
+                    tags.append(f"RSI超賣回升({rsi.iloc[-1]:.0f})"); score += 2
+                # 放量陽線
+                if vol.iloc[-1] > vol_ma5.iloc[-1] * 1.3:
+                    tags.append("放量"); score += 1
+                # 連續陽線確認
+                if price > float(close.iloc[-2]) > float(close.iloc[-3]):
+                    tags.append("連陽確認"); score += 1
+
+                conf      = "｜" + " + ".join(tags) if tags else ""
+                strength  = "⭐⭐⭐ 強力" if score >= 3 else ("⭐⭐ 中等" if score >= 2 else "⭐ 初步")
+                is_action = score >= 2   # 2分以上觸發 Toast
+
+                signals.append((
+                    f"🟢 【{strength}買入】{label}下降通道底反彈"
+                    f"｜下軌${ch['lower']:.2f} R²={ch['r2']:.2f} 現價${price:.2f}{conf}",
+                    "bull", is_action
+                ))
+
+            # 下降通道上軌突破（趨勢反轉）
+            if price > ch["upper"] and prev <= ch["upper"]:
+                is_bull_strong = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.5
+                strength = "⭐⭐⭐ 放量" if is_bull_strong else "⭐⭐"
+                signals.append((
+                    f"🚀 【{strength}反轉突破】{label}下降通道上軌突破"
+                    f"｜上軌${ch['upper']:.2f} R²={ch['r2']:.2f}",
+                    "bull", True
+                ))
+
+        # ── B. 上升通道頂部壓回（賣出機會）──────────────────────────────────
+        if ch["direction"] == "up":
+
+            touched  = prev_h >= ch["upper"] - tol
+            rejected = price < prev and is_bear_bar
+
+            if touched and rejected:
+                tags  = []
+                score = 0
+
+                if (hist.iloc[-1] > 0
+                        and abs(hist.iloc[-1]) < abs(hist.iloc[-2])):
+                    tags.append("MACD柱收縮"); score += 1
+                if dif.iloc[-1] < dif.iloc[-2]:
+                    tags.append("DIF轉弱"); score += 1
+                if not rsi.empty and rsi.iloc[-2] > 65 and rsi.iloc[-1] < rsi.iloc[-2]:
+                    tags.append(f"RSI超買回落({rsi.iloc[-1]:.0f})"); score += 2
+                if vol.iloc[-1] > vol_ma5.iloc[-1] * 1.3:
+                    tags.append("放量"); score += 1
+                if price < float(close.iloc[-2]) < float(close.iloc[-3]):
+                    tags.append("連陰確認"); score += 1
+
+                conf      = "｜" + " + ".join(tags) if tags else ""
+                strength  = "⭐⭐⭐ 強力" if score >= 3 else ("⭐⭐ 中等" if score >= 2 else "⭐ 初步")
+                is_action = score >= 2
+
+                signals.append((
+                    f"🔴 【{strength}賣出】{label}上升通道頂壓回"
+                    f"｜上軌${ch['upper']:.2f} R²={ch['r2']:.2f} 現價${price:.2f}{conf}",
+                    "bear", is_action
+                ))
+
+            # 上升通道下軌跌破（趨勢反轉）
+            if price < ch["lower"] and prev >= ch["lower"]:
+                is_bear_strong = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.5
+                strength = "⭐⭐⭐ 放量" if is_bear_strong else "⭐⭐"
+                signals.append((
+                    f"💀 【{strength}反轉跌破】{label}上升通道下軌跌破"
+                    f"｜下軌${ch['lower']:.2f} R²={ch['r2']:.2f}",
+                    "bear", True
+                ))
+
+    return signals
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 警示邏輯
 # ══════════════════════════════════════════════════════════════════════════════
 def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     """
-    偵測技術信號，若有新信號且 trigger_ai=True 且有 Groq Key，
-    自動呼叫 AI 分析並把結果存入 session_state['ai_signal_results']
+    偵測四大類技術信號：
+    A. 趨勢正在形成  B. 趨勢已確立
+    C. 趨勢反轉訊號  D. 原有突破（支撐/阻力）
     """
-    if len(df) < 30: return
+    if len(df) < 35: return
 
-    close, vol = df["Close"], df["Volume"]
-    new_signals = []   # 收集本次新觸發的信號
+    close  = df["Close"]
+    high   = df["High"]
+    low    = df["Low"]
+    opn    = df["Open"]
+    vol    = df["Volume"]
+    new_signals = []
 
-    dif, dea, _ = calc_macd(close)
-    if dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]:
-        add_alert(symbol, period_label, "MACD 金叉 🟢", "bull")
-        new_signals.append("MACD 金叉")
-    if dif.iloc[-1] < dea.iloc[-1] and dif.iloc[-2] >= dea.iloc[-2]:
-        add_alert(symbol, period_label, "MACD 死叉 🔴", "bear")
-        new_signals.append("MACD 死叉")
+    # ── 預算指標 ──────────────────────────────────────────────────────────────
+    e5   = calc_ema(close, 5)
+    e10  = calc_ema(close, 10)
+    e20  = calc_ema(close, 20)
+    e60  = calc_ema(close, 60)
+    dif, dea, hist = calc_macd(close)
+    vol_ma5 = vol.rolling(5).mean()
+    atr = (high - low).rolling(14).mean().iloc[-1]  # Average True Range
 
-    e5, e20 = calc_ema(close,5), calc_ema(close,20)
-    if e5.iloc[-1] > e20.iloc[-1] and e5.iloc[-2] <= e20.iloc[-2]:
-        add_alert(symbol, period_label, "EMA5 上穿 EMA20 ⬆️", "bull")
-        new_signals.append("EMA5 上穿 EMA20")
-    if e5.iloc[-1] < e20.iloc[-1] and e5.iloc[-2] >= e20.iloc[-2]:
-        add_alert(symbol, period_label, "EMA5 下穿 EMA20 ⬇️", "bear")
-        new_signals.append("EMA5 下穿 EMA20")
-
-    emas = [calc_ema(close,n).iloc[-1] for n,_ in EMA_CONFIGS]
-    if all(emas[i] > emas[i+1] for i in range(len(emas)-1)):
-        add_alert(symbol, period_label, "所有 EMA 多頭排列 🚀", "bull")
-        new_signals.append("EMA 多頭排列")
-
-    vol_ma5 = vol.rolling(5).mean().iloc[-1]
-    if vol.iloc[-1] > vol_ma5 * 2:
-        add_alert(symbol, period_label, f"成交量暴增 {vol.iloc[-1]/vol_ma5:.1f}x 均量 📊", "vol")
-        new_signals.append(f"成交量暴增 {vol.iloc[-1]/vol_ma5:.1f}x")
-
-    itvl_key = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(period_label, "1d")
-    pivots_h, pivots_l = calc_pivot(df, interval=itvl_key)
     price      = float(close.iloc[-1])
-    prev_price = float(close.iloc[-2]) if len(close) > 1 else price
+    prev_price = float(close.iloc[-2])
 
+    # ════════════════════════════════════════════════════════════════════════
+    # A. 趨勢「正在形成」偵測（Early-stage, 2-3 根確認）
+    # ════════════════════════════════════════════════════════════════════════
+
+    # A1. MACD 柱連續 3 根擴大（動能積累中）
+    h = hist.iloc
+    if (h[-1] > h[-2] > h[-3] > 0) and h[-3] > 0:
+        add_alert(symbol, period_label,
+                  f"📈 趨勢形成中｜MACD 柱連續擴大 ×3 (動能累積) +{h[-1]:.4f}", "bull")
+        new_signals.append("MACD柱連漲×3")
+    elif (h[-1] < h[-2] < h[-3] < 0) and h[-3] < 0:
+        add_alert(symbol, period_label,
+                  f"📉 趨勢形成中｜MACD 柱連續縮小 ×3 (賣壓累積) {h[-1]:.4f}", "bear")
+        new_signals.append("MACD柱連跌×3")
+
+    # A2. EMA5 斜率連續 3 根上升（短線趨勢啟動）
+    e5_slope = [e5.iloc[i] - e5.iloc[i-1] for i in range(-3, 0)]
+    if all(s > 0 for s in e5_slope) and e5.iloc[-1] > e20.iloc[-1]:
+        add_alert(symbol, period_label,
+                  f"📈 趨勢形成中｜EMA5 斜率連升 ×3 且在 EMA20 上方", "bull")
+        new_signals.append("EMA5斜率連升")
+    elif all(s < 0 for s in e5_slope) and e5.iloc[-1] < e20.iloc[-1]:
+        add_alert(symbol, period_label,
+                  f"📉 趨勢形成中｜EMA5 斜率連降 ×3 且在 EMA20 下方", "bear")
+        new_signals.append("EMA5斜率連降")
+
+    # A3. 價格連續 4 根收在 EMA20 之上（多方站穩）
+    above20 = all(close.iloc[i] > e20.iloc[i] for i in range(-4, 0))
+    below20 = all(close.iloc[i] < e20.iloc[i] for i in range(-4, 0))
+    if above20 and close.iloc[-5] <= e20.iloc[-5]:   # 之前在下方
+        add_alert(symbol, period_label,
+                  "📈 趨勢形成中｜價格連續 4 根站上 EMA20（多方確認）", "bull")
+        new_signals.append("站上EMA20×4")
+    elif below20 and close.iloc[-5] >= e20.iloc[-5]:
+        add_alert(symbol, period_label,
+                  "📉 趨勢形成中｜價格連續 4 根跌破 EMA20（空方確認）", "bear")
+        new_signals.append("跌破EMA20×4")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # E. 底部升浪偵測（對應圖片：空頭排列→收縮→多頭排列全程買入提醒）
+    # ════════════════════════════════════════════════════════════════════════
+
+    e30 = calc_ema(close, 30)
+
+    # ── E1. 最早期：MACD 負值底背離 + DIF 斜率轉正（空頭動能衰竭）────────
+    if len(close) >= 20:
+        # MACD 深負值後連續3根收縮（對應圖中 MACD 從 -0.48 開始回升）
+        hist_neg_shrink = (
+            hist.iloc[-1] < 0 and hist.iloc[-2] < 0 and hist.iloc[-3] < 0 and
+            abs(hist.iloc[-1]) < abs(hist.iloc[-2]) < abs(hist.iloc[-3]) and
+            abs(hist.iloc[-3]) > abs(hist.iloc[-20:].mean()) * 0.8   # 之前是深負值
+        )
+        dif_slope_turn = (
+            dif.iloc[-1] > dif.iloc[-2] > dif.iloc[-3]  # DIF 連升
+        )
+        if hist_neg_shrink and dif_slope_turn:
+            depth = abs(float(hist.iloc[-3]))
+            add_alert(symbol, period_label,
+                      f"🟡 【底部預警】MACD 負值底背離 + DIF 回升"
+                      f"（深度={depth:.4f}，空頭動能衰竭，升浪醞釀）", "bull")
+            new_signals.append("MACD底背離醞釀")
+
+    # ── E2. 早期確認：空頭 EMA 排列首次出現收縮（均線聚合）────────────────
+    was_full_bear = all(
+        float(e5.iloc[-5]) < float(e10.iloc[-5]),  # 簡單判斷幾天前是空頭
+    ) if len(close) >= 5 else False
+
+    spread_e5_e30_now  = float(e30.iloc[-1]) - float(e5.iloc[-1])
+    spread_e5_e30_prev = float(e30.iloc[-2]) - float(e5.iloc[-2])
+    spread_e5_e30_2ago = float(e30.iloc[-3]) - float(e5.iloc[-3])
+
+    # 空頭排列中 EMA 擴散縮小（空頭 EMA5 < EMA30，但差距收窄）
+    bear_spread_shrinking = (
+        spread_e5_e30_now > 0 and      # 仍是空頭（EMA5 < EMA30）
+        spread_e5_e30_now < spread_e5_e30_prev < spread_e5_e30_2ago and   # 連縮
+        spread_e5_e30_now < spread_e5_e30_2ago * 0.6                      # 縮幅>40%
+    )
+    _dif_slope_turn = dif.iloc[-1] > dif.iloc[-2] > dif.iloc[-3]
+    if bear_spread_shrinking and hist.iloc[-1] < 0 and _dif_slope_turn:
+        add_alert(symbol, period_label,
+                  f"🟡 【底部預警】空頭 EMA 排列收縮中"
+                  f"（EMA5-30 差距 {spread_e5_e30_2ago:.3f}→{spread_e5_e30_now:.3f}）"
+                  f" 多頭排列即將形成", "bull")
+        new_signals.append("空頭EMA收縮")
+
+    # ── E3. 關鍵確認：EMA5 上穿 EMA10 + EMA20（升浪啟動訊號）──────────────
+    # 對應圖中均線從聚合點開始多頭發散
+    e5_cross_e10 = e5.iloc[-1] > e10.iloc[-1] and e5.iloc[-2] <= e10.iloc[-2]
+    e5_cross_e20 = e5.iloc[-1] > e20.iloc[-1] and e5.iloc[-2] <= e20.iloc[-2]
+    e5_cross_e30 = e5.iloc[-1] > e30.iloc[-1] and e5.iloc[-2] <= e30.iloc[-2]
+
+    cross_count = sum([e5_cross_e10, e5_cross_e20, e5_cross_e30])
+    if cross_count >= 2:
+        lines_crossed = []
+        if e5_cross_e10: lines_crossed.append("EMA10")
+        if e5_cross_e20: lines_crossed.append("EMA20")
+        if e5_cross_e30: lines_crossed.append("EMA30")
+        add_alert(symbol, period_label,
+                  f"🟢 【買入訊號】EMA5 同時上穿 {'/'.join(lines_crossed)}"
+                  f"（均線黃金交叉集群，升浪啟動）", "bull")
+        new_signals.append(f"EMA5金叉集群×{cross_count}")
+
+    # ── E4. 升浪加速：空頭→多頭排列完全翻轉（圖中升浪中段最強訊號）────────
+    was_bear_order = (
+        len(close) >= 10 and
+        float(e5.iloc[-10]) < float(e10.iloc[-10]) < float(e20.iloc[-10])
+    )
+    is_now_bull_order = (
+        float(e5.iloc[-1]) > float(e10.iloc[-1]) > float(e20.iloc[-1]) > float(e30.iloc[-1])
+    )
+    if was_bear_order and is_now_bull_order:
+        # 計算升幅
+        bottom_price = float(close.iloc[-20:].min()) if len(close) >= 20 else price
+        rise_pct = (price - bottom_price) / bottom_price * 100
+        add_alert(symbol, period_label,
+                  f"🚀 【買入確認】空頭排列完全翻轉為多頭排列"
+                  f"（距底部 +{rise_pct:.2f}%，升浪已確立）", "bull")
+        new_signals.append("空→多排列翻轉")
+
+    # ── E5. 底部多指標共振買入（最高強度，對應圖中最佳買點區域）────────────
+    macd_gold = dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]  # MACD金叉
+    price_above_e20 = float(close.iloc[-1]) > float(e20.iloc[-1])
+    e5_above_e10 = float(e5.iloc[-1]) > float(e10.iloc[-1])
+    bull_candle = float(close.iloc[-1]) > float(opn.iloc[-1])
+    vol_expand = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.2   # 量能配合
+
+    bottom_resonance = sum([
+        macd_gold,
+        price_above_e20,
+        e5_above_e10,
+        bull_candle,
+        vol_expand,
+        hist.iloc[-1] > hist.iloc[-2] > 0,   # MACD柱擴大
+    ])
+    if bottom_resonance >= 4:
+        tags = []
+        if macd_gold:          tags.append("MACD金叉")
+        if price_above_e20:    tags.append("站上EMA20")
+        if e5_above_e10:       tags.append("EMA排列")
+        if bull_candle:        tags.append("陽線確認")
+        if vol_expand:         tags.append("量能配合")
+        add_alert(symbol, period_label,
+                  f"🔔 【強烈買入】底部多指標共振 ({bottom_resonance}/6)"
+                  f" ｜{'＋'.join(tags)}", "bull")
+        new_signals.append(f"底部共振×{bottom_resonance}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # B. 趨勢「已確立」偵測（多指標共振）
+    # ════════════════════════════════════════════════════════════════════════
+
+    # B1. MACD 金叉 / 死叉
+    if dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]:
+        add_alert(symbol, period_label, "✅ 趨勢確立｜MACD 金叉 🟢", "bull")
+        new_signals.append("MACD金叉")
+    if dif.iloc[-1] < dea.iloc[-1] and dif.iloc[-2] >= dea.iloc[-2]:
+        add_alert(symbol, period_label, "✅ 趨勢確立｜MACD 死叉 🔴", "bear")
+        new_signals.append("MACD死叉")
+
+    # B2. EMA5 穿越 EMA20
+    if e5.iloc[-1] > e20.iloc[-1] and e5.iloc[-2] <= e20.iloc[-2]:
+        add_alert(symbol, period_label, "✅ 趨勢確立｜EMA5 上穿 EMA20 ⬆️", "bull")
+        new_signals.append("EMA5上穿EMA20")
+    if e5.iloc[-1] < e20.iloc[-1] and e5.iloc[-2] >= e20.iloc[-2]:
+        add_alert(symbol, period_label, "✅ 趨勢確立｜EMA5 下穿 EMA20 ⬇️", "bear")
+        new_signals.append("EMA5下穿EMA20")
+
+    # B3. 多頭/空頭 EMA 完整排列（強趨勢共振）
+    ema_vals = [calc_ema(close, n).iloc[-1] for n, _ in EMA_CONFIGS]
+    if all(ema_vals[i] > ema_vals[i+1] for i in range(len(ema_vals)-1)):
+        add_alert(symbol, period_label, "🚀 趨勢確立｜全 EMA 多頭排列（強勢上升趨勢）", "bull")
+        new_signals.append("全EMA多頭排列")
+    elif all(ema_vals[i] < ema_vals[i+1] for i in range(len(ema_vals)-1)):
+        add_alert(symbol, period_label, "💀 趨勢確立｜全 EMA 空頭排列（強勢下降趨勢）", "bear")
+        new_signals.append("全EMA空頭排列")
+
+    # B4. 放量突破/跌破支撐阻力
+    itvl_key   = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(period_label, "1d")
+    pivots_h, pivots_l = calc_pivot(df, interval=itvl_key)
     if pivots_h:
         broken = [p[1] for p in pivots_h if prev_price <= p[1] < price]
         if broken:
-            add_alert(symbol, period_label, f"突破阻力位 ${max(broken):.2f} ⚡", "bull")
-            new_signals.append(f"突破阻力位 ${max(broken):.2f}")
-
+            vol_surge = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.5
+            tag = "放量" if vol_surge else ""
+            add_alert(symbol, period_label,
+                      f"✅ 趨勢確立｜{tag}突破阻力位 ${max(broken):.2f} ⚡", "bull")
+            new_signals.append(f"突破阻力${max(broken):.2f}")
     if pivots_l:
         broken = [p[1] for p in pivots_l if price < p[1] <= prev_price]
         if broken:
-            add_alert(symbol, period_label, f"跌破支撐位 ${min(broken):.2f} ⚠️", "bear")
-            new_signals.append(f"跌破支撐位 ${min(broken):.2f}")
+            vol_surge = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.5
+            tag = "放量" if vol_surge else ""
+            add_alert(symbol, period_label,
+                      f"✅ 趨勢確立｜{tag}跌破支撐位 ${min(broken):.2f} ⚠️", "bear")
+            new_signals.append(f"跌破支撐${min(broken):.2f}")
+
+    # B5. 異常放量
+    if vol.iloc[-1] > vol_ma5.iloc[-1] * 2:
+        add_alert(symbol, period_label,
+                  f"📊 異常放量 {vol.iloc[-1]/vol_ma5.iloc[-1]:.1f}x 均量", "vol")
+        new_signals.append(f"異常放量{vol.iloc[-1]/vol_ma5.iloc[-1]:.1f}x")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # C0. 通道反轉偵測（下降通道底反彈 / 上升通道頂壓回 / 通道突破）
+    # ════════════════════════════════════════════════════════════════════════
+    for _ch_result in detect_channel_signals(df):
+        _ch_msg, _ch_type = _ch_result[0], _ch_result[1]
+        _is_action = _ch_result[2] if len(_ch_result) > 2 else False
+        add_alert(symbol, period_label, _ch_msg, _ch_type)
+        new_signals.append(_ch_msg[:25])
+        # 強力信號觸發即時 Toast 彈窗
+        if _is_action:
+            _icon = "🟢" if _ch_type == "bull" else "🔴"
+            st.toast(f"{_icon} {symbol} {period_label}\n{_ch_msg[:60]}", icon=_icon)
+
+    # C. 趨勢「反轉」偵測
+    # ════════════════════════════════════════════════════════════════════════
+
+    # C1. MACD 背離（Price vs MACD histogram）
+    # 多頭背離：價格創新低但 MACD 柱走高（底背離）
+    if len(close) >= 20:
+        recent_low_price  = close.iloc[-20:].min()
+        recent_low_macd_h = hist.iloc[-20:].min()
+        # 底背離：當前是近20根新低，但MACD柱比上個低點高
+        if (close.iloc[-1] <= recent_low_price * 1.002 and
+            hist.iloc[-1] > hist.iloc[-10:].min() * 1.3 and
+            hist.iloc[-1] < 0):
+            add_alert(symbol, period_label,
+                      "🔄 反轉訊號｜MACD 底背離（價格新低，動能回升）", "bull")
+            new_signals.append("MACD底背離")
+
+        # 頂背離：當前是近20根新高，但MACD柱比上個高點低
+        recent_high_price = close.iloc[-20:].max()
+        if (close.iloc[-1] >= recent_high_price * 0.998 and
+            hist.iloc[-1] < hist.iloc[-10:].max() * 0.7 and
+            hist.iloc[-1] > 0):
+            add_alert(symbol, period_label,
+                      "🔄 反轉訊號｜MACD 頂背離（價格新高，動能減弱）", "bear")
+            new_signals.append("MACD頂背離")
+
+    # C2. K 線反轉形態
+    body     = abs(close.iloc[-1] - opn.iloc[-1])
+    up_wick  = high.iloc[-1] - max(close.iloc[-1], opn.iloc[-1])
+    dn_wick  = min(close.iloc[-1], opn.iloc[-1]) - low.iloc[-1]
+    body_avg = abs(close - opn).rolling(10).mean().iloc[-1]
+
+    # 錘頭（下影線長 > 2倍實體，在下降趨勢末端）→ 多頭反轉
+    if (dn_wick > body * 2 and dn_wick > body_avg and
+            up_wick < body * 0.3 and
+            close.iloc[-3] < close.iloc[-5]):     # 之前在下降
+        add_alert(symbol, period_label,
+                  f"🔄 反轉訊號｜錘頭K線（下影線={dn_wick:.2f}，潛在底部反彈）", "bull")
+        new_signals.append("錘頭K線")
+
+    # 流星（上影線長 > 2倍實體，在上升趨勢末端）→ 空頭反轉
+    if (up_wick > body * 2 and up_wick > body_avg and
+            dn_wick < body * 0.3 and
+            close.iloc[-3] > close.iloc[-5]):     # 之前在上升
+        add_alert(symbol, period_label,
+                  f"🔄 反轉訊號｜流星K線（上影線={up_wick:.2f}，潛在頂部反轉）", "bear")
+        new_signals.append("流星K線")
+
+    # 吞噬形態（Engulfing）
+    prev_body = close.iloc[-2] - opn.iloc[-2]
+    curr_body = close.iloc[-1] - opn.iloc[-1]
+    # 多頭吞噬：前紅後大綠
+    if (prev_body < 0 and curr_body > 0 and
+            opn.iloc[-1] < close.iloc[-2] and close.iloc[-1] > opn.iloc[-2] and
+            abs(curr_body) > abs(prev_body)):
+        add_alert(symbol, period_label,
+                  "🔄 反轉訊號｜多頭吞噬（大陽線吞噬前陰線）", "bull")
+        new_signals.append("多頭吞噬")
+    # 空頭吞噬：前綠後大紅
+    if (prev_body > 0 and curr_body < 0 and
+            opn.iloc[-1] > close.iloc[-2] and close.iloc[-1] < opn.iloc[-2] and
+            abs(curr_body) > abs(prev_body)):
+        add_alert(symbol, period_label,
+                  "🔄 反轉訊號｜空頭吞噬（大陰線吞噬前陽線）", "bear")
+        new_signals.append("空頭吞噬")
+
+    # C3. 快速跌破 EMA60（趨勢破壞）
+    if (close.iloc[-1] < e60.iloc[-1] and
+            close.iloc[-2] >= e60.iloc[-2] and
+            close.iloc[-3] >= e60.iloc[-3]):      # 連續2根在上方，突然跌破
+        chg_pct = abs(price - float(e60.iloc[-1])) / float(e60.iloc[-1]) * 100
+        add_alert(symbol, period_label,
+                  f"⚠️ 反轉訊號｜跌破 EMA60（趨勢支撐破壞，偏差 {chg_pct:.1f}%）", "bear")
+        new_signals.append("跌破EMA60")
+    if (close.iloc[-1] > e60.iloc[-1] and
+            close.iloc[-2] <= e60.iloc[-2] and
+            close.iloc[-3] <= e60.iloc[-3]):
+        chg_pct = abs(price - float(e60.iloc[-1])) / float(e60.iloc[-1]) * 100
+        add_alert(symbol, period_label,
+                  f"📈 反轉訊號｜突破 EMA60（趨勢壓力突破，偏差 {chg_pct:.1f}%）", "bull")
+        new_signals.append("突破EMA60")
+
+    # C3b. RSI 超賣/超買反轉
+    rsi_series = calc_rsi(close, 14)
+    if len(rsi_series.dropna()) >= 5:
+        rsi_now  = float(rsi_series.iloc[-1])
+        rsi_prev = float(rsi_series.iloc[-2])
+        # RSI 從超賣區(<30)回升穿越30
+        if rsi_prev < 30 and rsi_now >= 30:
+            add_alert(symbol, period_label,
+                      f"🟢 反轉訊號｜RSI 超賣回升穿越30 ({rsi_now:.1f}) 潛在底部反彈", "bull")
+            new_signals.append(f"RSI超賣回升{rsi_now:.0f}")
+        # RSI 從超買區(>70)回落穿越70
+        elif rsi_prev > 70 and rsi_now <= 70:
+            add_alert(symbol, period_label,
+                      f"🔴 反轉訊號｜RSI 超買回落穿越70 ({rsi_now:.1f}) 潛在頂部回撤", "bear")
+            new_signals.append(f"RSI超買回落{rsi_now:.0f}")
+
+    # C4. EMA5/EMA10 黃金/死亡交叉（短線反轉確認）
+    if e5.iloc[-1] > e10.iloc[-1] and e5.iloc[-2] <= e10.iloc[-2]:
+        add_alert(symbol, period_label,
+                  "🔄 反轉訊號｜EMA5 上穿 EMA10（短線動能反轉向上）", "bull")
+        new_signals.append("EMA5/10金叉")
+    if e5.iloc[-1] < e10.iloc[-1] and e5.iloc[-2] >= e10.iloc[-2]:
+        add_alert(symbol, period_label,
+                  "🔄 反轉訊號｜EMA5 下穿 EMA10（短線動能反轉向下）", "bear")
+        new_signals.append("EMA5/10死叉")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # D. 均線集群反轉偵測（對應圖片場景：多頭排列頂部死亡交叉集群）
+    # ════════════════════════════════════════════════════════════════════════
+
+    e30  = calc_ema(close, 30)
+    e_vals_now  = {5: e5.iloc[-1],  10: e10.iloc[-1],
+                   20: e20.iloc[-1], 30: e30.iloc[-1], 60: e60.iloc[-1]}
+    e_vals_prev = {5: e5.iloc[-2],  10: e10.iloc[-2],
+                   20: e20.iloc[-2], 30: e30.iloc[-2], 60: e60.iloc[-2]}
+
+    # D1. 均線集群收縮（EMA5~EMA60 價差急劇縮小 → 即將死叉）
+    spread_now  = e_vals_now[5]  - e_vals_now[60]
+    spread_prev = e_vals_prev[5] - e_vals_prev[60]
+    spread_2ago = float(e5.iloc[-3]) - float(e60.iloc[-3])
+    was_bull_spread = spread_2ago > 0 and spread_prev > 0  # 之前是多頭排列
+    if (was_bull_spread and
+            spread_now < spread_prev * 0.5 and   # 擴散值縮小超過50%
+            spread_now > 0):                      # 尚未死叉但快了
+        add_alert(symbol, period_label,
+                  f"⚠️ 頂部預警｜EMA5-60 多頭擴散急速收縮"
+                  f"（{spread_2ago:.3f}→{spread_prev:.3f}→{spread_now:.3f}）"
+                  f" 死叉風險升高", "bear")
+        new_signals.append("EMA集群收縮")
+
+    # D2. 均線集群死亡交叉：EMA5 連續下穿多條均線（圖片核心場景）
+    crossed_down = []
+    for n, e_now, e_prev in [
+        (10,  e10,  None),
+        (20,  e20,  None),
+        (30,  e30,  None),
+    ]:
+        e_ser = calc_ema(close, n)
+        if e5.iloc[-1] < e_ser.iloc[-1] and e5.iloc[-2] >= e_ser.iloc[-2]:
+            crossed_down.append(f"EMA{n}")
+    if len(crossed_down) >= 2:
+        add_alert(symbol, period_label,
+                  f"🔴 【賣出信號】EMA5 同時下穿 {'/'.join(crossed_down)}"
+                  f"（均線死亡交叉集群，強烈賣出訊號）", "bear")
+        new_signals.append(f"EMA5死叉集群×{len(crossed_down)}")
+    elif len(crossed_down) == 1:
+        add_alert(symbol, period_label,
+                  f"🔴 反轉訊號｜EMA5 下穿 {crossed_down[0]}", "bear")
+        new_signals.append(f"EMA5下穿{crossed_down[0]}")
+
+    # D3. 頂部多指標共振賣出（最高強度警告）
+    # 條件：價格從近期高點回落 + MACD 頂背離 + 均線開始死叉 + 放量陰線
+    recent_high = float(close.iloc[-20:].max()) if len(close) >= 20 else price
+    price_from_top_pct = (recent_high - price) / recent_high * 100
+    macd_topdiv = (close.iloc[-1] >= recent_high * 0.997 and
+                   hist.iloc[-1] < hist.iloc[-10:].max() * 0.7 and
+                   hist.iloc[-1] > 0)
+    ema_death   = len(crossed_down) >= 1
+    bear_candle = float(close.iloc[-1]) < float(opn.iloc[-1])
+    vol_surge   = vol.iloc[-1] > vol_ma5.iloc[-1] * 1.3
+
+    resonance_count = sum([macd_topdiv, ema_death, bear_candle, vol_surge,
+                           price_from_top_pct > 0.3])
+    if resonance_count >= 3:
+        tags = []
+        if macd_topdiv:            tags.append("MACD頂背離")
+        if ema_death:              tags.append(f"均線死叉")
+        if bear_candle:            tags.append("頂部陰線")
+        if vol_surge:              tags.append("放量出貨")
+        if price_from_top_pct>0.3: tags.append(f"距高點-{price_from_top_pct:.1f}%")
+        add_alert(symbol, period_label,
+                  f"🚨 【強烈賣出】頂部多指標共振 ({resonance_count}/5)"
+                  f" ｜{'＋'.join(tags)}", "bear")
+        new_signals.append(f"頂部共振×{resonance_count}")
+
+    # D4. 多頭排列崩潰：前一根是完整多頭排列，現在 EMA 排列開始倒序
+    was_full_bull = all(e_vals_prev[a] > e_vals_prev[b]
+                        for a, b in [(5,10),(10,20),(20,30),(30,60)])
+    is_bull_broken = not all(e_vals_now[a] > e_vals_now[b]
+                             for a, b in [(5,10),(10,20),(20,30),(30,60)])
+    if was_full_bull and is_bull_broken:
+        add_alert(symbol, period_label,
+                  "⚠️ 頂部預警｜多頭 EMA 排列首次出現破口（趨勢轉弱開始）", "bear")
+        new_signals.append("多頭排列破口")
 
     # ── 有新信號且啟用 AI → 自動觸發 Groq 分析 ─────────────────────────────
     if not new_signals or not trigger_ai:
         return
-
     if not get_groq_key():
-        return   # 沒有 Key，靜默跳過
-
-    # 避免同一信號重複分析（用信號文字做 key）
-    ai_key   = f"ai_signal_{symbol}_{period_label}_{'_'.join(new_signals[:2])}"
+        return
+    ai_key = f"ai_signal_{symbol}_{period_label}_{'_'.join(new_signals[:2])}"
     if ai_key in st.session_state:
-        return  # 已分析過
+        return
 
     signal_summary = "、".join(new_signals)
     prompt = build_analysis_prompt(symbol, period_label, df, mkt)
-    # 在 prompt 頭部加入觸發信號說明
     prompt = f"【觸發信號】{symbol} {period_label} 剛出現：{signal_summary}\n\n" + prompt
-
     result = call_groq_analysis(prompt)
     result["_signals"]      = new_signals
     result["_symbol"]       = symbol
     result["_period"]       = period_label
     result["_trigger_time"] = datetime.now().strftime("%H:%M:%S")
     st.session_state[ai_key] = result
-
-    # 存入統一的 signal AI 結果列表（供 UI 顯示）
     if "ai_signal_results" not in st.session_state:
         st.session_state["ai_signal_results"] = []
-    # 置頂，最多保留 20 筆
     st.session_state["ai_signal_results"].insert(0, result)
     st.session_state["ai_signal_results"] = st.session_state["ai_signal_results"][:20]
 
@@ -2118,6 +2663,42 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
                       annotation_text=f"支撐 {s:.2f}",
                       annotation_font=dict(size=12, color="#88ff88"),
                       annotation_bgcolor="rgba(10,30,10,0.8)", row=1, col=1)
+
+    # ── 線性回歸通道 ─────────────────────────────────────────────────────────
+    try:
+        ch = calc_channel(df, lookback=min(30, len(df)))
+        if ch and ch["r2"] >= 0.40:
+            import numpy as np
+            sub    = df.tail(min(30, len(df)))
+            x      = np.arange(len(sub))
+            hi_c   = np.polyfit(x, sub["High"].values.astype(float), 1)
+            lo_c   = np.polyfit(x, sub["Low"].values.astype(float), 1)
+            mid_c  = np.polyfit(x, sub["Close"].values.astype(float), 1)
+            xlbl_ch = xlabels[-min(30, len(df)):]
+            x_ends  = [0, len(sub)-1]
+
+            ch_color  = "#4488ff" if ch["direction"] == "up" else (
+                        "#ff6644" if ch["direction"] == "down" else "#aaaaaa")
+            ch_label  = {"up":"上升通道","down":"下降通道","flat":"橫盤通道"}[ch["direction"]]
+
+            for coeffs, y_offset, dash, ann in [
+                (hi_c,  0, "solid", f"{ch_label} R²={ch['r2']:.2f}"),
+                (lo_c,  0, "solid", None),
+                (mid_c, 0, "dot",   None),
+            ]:
+                y_vals = [float(np.polyval(coeffs, xi)) for xi in x_ends]
+                fig.add_trace(go.Scatter(
+                    x=[xlbl_ch[0], xlbl_ch[-1]],
+                    y=y_vals,
+                    mode="lines",
+                    line=dict(color=ch_color, width=1.2 if dash=="solid" else 0.8,
+                              dash=dash),
+                    opacity=0.65,
+                    showlegend=(ann is not None),
+                    name=ann or "",
+                ), row=1, col=1)
+    except Exception:
+        pass
 
     # 最高最低
     max_pos = int(df["High"].values.argmax())
