@@ -2194,8 +2194,8 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
             new_signals.append("MACD底背離醞釀")
 
     # ── E2. 早期確認：空頭 EMA 排列首次出現收縮（均線聚合）────────────────
-    was_full_bear = all(
-        float(e5.iloc[-5]) < float(e10.iloc[-5]),  # 簡單判斷幾天前是空頭
+    was_full_bear = (
+        float(e5.iloc[-5]) < float(e10.iloc[-5])   # 簡單判斷幾天前是空頭
     ) if len(close) >= 5 else False
 
     spread_e5_e30_now  = float(e30.iloc[-1]) - float(e5.iloc[-1])
